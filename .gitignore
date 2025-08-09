@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+
+# Editor directories and files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Temporary files
+*.tmp
+*.bak
+*.log
+
+# Test artifacts
+tests/tmp/
+tests/output/

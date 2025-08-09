@@ -1,0 +1,521 @@
+#!/usr/bin/env bash
+
+# pk - Port Killer: A smart development tool for freeing ports
+# Author: Al Chang
+# Version: 1.0.0
+# License: MIT
+
+set -euo pipefail
+
+# Color codes for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+NC='\033[0m' # No Color
+
+# Configuration
+GRACE_PERIOD=2
+FORCE_PERIOD=1
+PARENT_PERIOD=1
+FINAL_CHECK_DELAY=0.5
+
+# Global flags
+VERBOSE=false
+DRY_RUN=false
+FORCE_KILL=false
+ULTRA_FORCE=false
+NO_PARENT=false
+QUIET=false
+
+# Known process monitors that respawn children
+KNOWN_MONITORS=(
+    "nodemon"
+    "pm2"
+    "supervisor"
+    "ts-node-dev"
+    "webpack"
+    "webpack-dev-server"
+    "vite"
+    "next"
+    "node-dev"
+    "forever"
+    "systemd"
+    "launchd"
+    "nohup"
+)
+
+# Version
+VERSION="1.0.0"
+
+# Usage function
+usage() {
+    cat << EOF
+pk (portkill) v${VERSION} - Smart port killer for development
+
+Usage: pk [OPTIONS] <port>
+
+OPTIONS:
+    -f, --force         Skip graceful shutdown, start with SIGKILL
+    -F, --ultra-force   Nuclear option - immediate sudo kill
+    -v, --verbose       Show detailed process information
+    -q, --quiet         Minimal output
+    -n, --no-parent     Don't hunt for parent processes
+    -d, --dry-run       Show what would be killed without doing it
+    -h, --help          Show this help message
+    -V, --version       Show version
+
+EXAMPLES:
+    pk 3000             # Smart kill of whatever's on port 3000
+    pk -f 8080          # Force kill immediately (skip SIGTERM)
+    pk -v 3000          # Verbose output showing all steps
+    pk -d 3000          # Dry run - see what would be killed
+    pk -F 3000          # Nuclear option with sudo
+
+The tool uses a multi-stage approach:
+  1. SIGTERM (graceful) - gives process time to cleanup
+  2. SIGKILL (force) - terminates stubborn processes  
+  3. Parent hunt - finds and kills monitor processes
+  4. Nuclear - sudo kills everything (requires password)
+
+GitHub: https://github.com/alchang/pk
+EOF
+}
+
+# Logging functions
+log() {
+    [[ "$QUIET" == false ]] && echo -e "$1"
+}
+
+log_verbose() {
+    [[ "$VERBOSE" == true && "$QUIET" == false ]] && echo -e "${CYAN}[VERBOSE]${NC} $1" >&2
+}
+
+log_info() {
+    log "${BLUE}[INFO]${NC} $1"
+}
+
+log_success() {
+    log "${GREEN}[✓]${NC} $1"
+}
+
+log_warning() {
+    log "${YELLOW}[!]${NC} $1"
+}
+
+log_error() {
+    log "${RED}[✗]${NC} $1" >&2
+}
+
+# Get all PIDs on a port
+get_pids_on_port() {
+    local port=$1
+    lsof -ti :$port 2>/dev/null || true
+}
+
+# Get detailed info about processes on port
+get_process_info() {
+    local port=$1
+    lsof -i :$port 2>/dev/null || true
+}
+
+# Check if process exists
+process_exists() {
+    local pid=$1
+    kill -0 "$pid" 2>/dev/null
+}
+
+# Get parent PID
+get_parent_pid() {
+    local pid=$1
+    ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || echo ""
+}
+
+# Get process command
+get_process_command() {
+    local pid=$1
+    ps -o comm= -p "$pid" 2>/dev/null || echo ""
+}
+
+# Get full command line
+get_process_cmdline() {
+    local pid=$1
+    ps -o command= -p "$pid" 2>/dev/null || echo ""
+}
+
+# Check if process is a known monitor
+is_monitor_process() {
+    local cmd=$1
+    for monitor in "${KNOWN_MONITORS[@]}"; do
+        if [[ "$cmd" == *"$monitor"* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Kill a single PID with specified signal
+kill_pid() {
+    local pid=$1
+    local signal=${2:-TERM}
+    local use_sudo=${3:-false}
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        log_verbose "Would kill PID $pid with signal $signal (sudo: $use_sudo)"
+        return 0
+    fi
+    
+    if [[ "$use_sudo" == true ]]; then
+        sudo kill -$signal "$pid" 2>/dev/null || true
+    else
+        kill -$signal "$pid" 2>/dev/null || true
+    fi
+}
+
+# Stage 1: Graceful shutdown with SIGTERM
+stage_graceful_shutdown() {
+    local port=$1
+    local pids=$(get_pids_on_port "$port")
+    
+    if [[ -z "$pids" ]]; then
+        return 1
+    fi
+    
+    log_info "Stage 1: Attempting graceful shutdown (SIGTERM)"
+    
+    local count=0
+    while IFS= read -r pid; do
+        [[ -z "$pid" ]] && continue
+        local cmd=$(get_process_command "$pid")
+        log_verbose "  Sending SIGTERM to PID $pid ($cmd)"
+        kill_pid "$pid" "TERM" false
+        ((count++))
+    done <<< "$pids"
+    
+    log_verbose "Sent SIGTERM to $count process(es), waiting ${GRACE_PERIOD}s..."
+    
+    if [[ "$DRY_RUN" == false ]]; then
+        sleep "$GRACE_PERIOD"
+    fi
+    
+    # Check if any processes remain
+    local remaining=$(get_pids_on_port "$port")
+    if [[ -z "$remaining" ]]; then
+        log_success "Graceful shutdown successful"
+        return 0
+    else
+        log_warning "Some processes survived SIGTERM"
+        return 1
+    fi
+}
+
+# Stage 2: Force kill with SIGKILL
+stage_force_kill() {
+    local port=$1
+    local pids=$(get_pids_on_port "$port")
+    
+    if [[ -z "$pids" ]]; then
+        return 1
+    fi
+    
+    log_info "Stage 2: Force killing with SIGKILL"
+    
+    local count=0
+    while IFS= read -r pid; do
+        [[ -z "$pid" ]] && continue
+        local cmd=$(get_process_command "$pid")
+        log_verbose "  Sending SIGKILL to PID $pid ($cmd)"
+        kill_pid "$pid" "KILL" false
+        ((count++))
+    done <<< "$pids"
+    
+    log_verbose "Sent SIGKILL to $count process(es), waiting ${FORCE_PERIOD}s..."
+    
+    if [[ "$DRY_RUN" == false ]]; then
+        sleep "$FORCE_PERIOD"
+    fi
+    
+    # Check if any processes remain
+    local remaining=$(get_pids_on_port "$port")
+    if [[ -z "$remaining" ]]; then
+        log_success "Force kill successful"
+        return 0
+    else
+        log_warning "Some processes survived SIGKILL"
+        return 1
+    fi
+}
+
+# Stage 3: Hunt and kill parent processes
+stage_parent_hunt() {
+    local port=$1
+    local pids=$(get_pids_on_port "$port")
+    
+    if [[ -z "$pids" ]]; then
+        return 1
+    fi
+    
+    log_info "Stage 3: Hunting parent/monitor processes"
+    
+    declare -A parents_to_kill
+    
+    # Find all parent processes
+    while IFS= read -r pid; do
+        [[ -z "$pid" ]] && continue
+        local ppid=$(get_parent_pid "$pid")
+        [[ -z "$ppid" || "$ppid" == "1" ]] && continue
+        
+        local parent_cmd=$(get_process_cmdline "$ppid")
+        
+        # Check if parent is a monitor process
+        if is_monitor_process "$parent_cmd"; then
+            parents_to_kill[$ppid]="$parent_cmd"
+            log_verbose "  Found monitor parent: PID $ppid - $parent_cmd"
+        fi
+        
+        # Also check grandparent
+        local gppid=$(get_parent_pid "$ppid")
+        if [[ -n "$gppid" && "$gppid" != "1" ]]; then
+            local gparent_cmd=$(get_process_cmdline "$gppid")
+            if is_monitor_process "$gparent_cmd"; then
+                parents_to_kill[$gppid]="$gparent_cmd"
+                log_verbose "  Found monitor grandparent: PID $gppid - $gparent_cmd"
+            fi
+        fi
+    done <<< "$pids"
+    
+    # Kill the parent processes
+    if [[ ${#parents_to_kill[@]} -gt 0 ]]; then
+        log_info "Killing ${#parents_to_kill[@]} parent/monitor process(es)"
+        for ppid in "${!parents_to_kill[@]}"; do
+            log_verbose "  Killing parent PID $ppid: ${parents_to_kill[$ppid]}"
+            kill_pid "$ppid" "KILL" false
+        done
+        
+        if [[ "$DRY_RUN" == false ]]; then
+            sleep "$PARENT_PERIOD"
+        fi
+    else
+        log_verbose "No monitor parents found"
+    fi
+    
+    # Kill process groups
+    log_verbose "Attempting to kill process groups"
+    while IFS= read -r pid; do
+        [[ -z "$pid" ]] && continue
+        local pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+        if [[ -n "$pgid" ]]; then
+            log_verbose "  Killing process group $pgid"
+            if [[ "$DRY_RUN" == false ]]; then
+                kill -KILL -"$pgid" 2>/dev/null || true
+            fi
+        fi
+    done <<< "$pids"
+    
+    if [[ "$DRY_RUN" == false ]]; then
+        sleep 0.5
+    fi
+    
+    # Check if port is free
+    local remaining=$(get_pids_on_port "$port")
+    if [[ -z "$remaining" ]]; then
+        log_success "Parent hunt successful"
+        return 0
+    else
+        log_warning "Port still occupied after parent hunt"
+        return 1
+    fi
+}
+
+# Stage 4: Nuclear option with sudo
+stage_nuclear() {
+    local port=$1
+    local pids=$(get_pids_on_port "$port")
+    
+    if [[ -z "$pids" ]]; then
+        return 1
+    fi
+    
+    log_warning "Stage 4: Nuclear option (requires sudo)"
+    
+    if [[ "$DRY_RUN" == true ]]; then
+        log_info "Would use sudo to kill remaining processes"
+        while IFS= read -r pid; do
+            [[ -z "$pid" ]] && continue
+            local cmd=$(get_process_cmdline "$pid")
+            log_verbose "  Would sudo kill PID $pid: $cmd"
+        done <<< "$pids"
+        return 0
+    fi
+    
+    # Try with sudo
+    while IFS= read -r pid; do
+        [[ -z "$pid" ]] && continue
+        log_verbose "  Sudo killing PID $pid"
+        kill_pid "$pid" "KILL" true
+    done <<< "$pids"
+    
+    # Also try fuser as backup
+    log_verbose "Using fuser as backup"
+    sudo fuser -k "$port/tcp" 2>/dev/null || true
+    
+    sleep "$FINAL_CHECK_DELAY"
+    
+    # Final check
+    local remaining=$(get_pids_on_port "$port")
+    if [[ -z "$remaining" ]]; then
+        log_success "Nuclear option successful"
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Main execution function
+main() {
+    local port=""
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -V|--version)
+                echo "pk (portkill) version ${VERSION}"
+                exit 0
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -q|--quiet)
+                QUIET=true
+                shift
+                ;;
+            -f|--force)
+                FORCE_KILL=true
+                shift
+                ;;
+            -F|--ultra-force)
+                ULTRA_FORCE=true
+                shift
+                ;;
+            -n|--no-parent)
+                NO_PARENT=true
+                shift
+                ;;
+            -d|--dry-run)
+                DRY_RUN=true
+                VERBOSE=true
+                shift
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+            *)
+                if [[ -z "$port" ]]; then
+                    port=$1
+                else
+                    log_error "Multiple ports specified. pk handles one port at a time."
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    # Validate port
+    if [[ -z "$port" ]]; then
+        log_error "No port specified"
+        usage
+        exit 1
+    fi
+    
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 || "$port" -gt 65535 ]]; then
+        log_error "Invalid port: $port (must be 1-65535)"
+        exit 1
+    fi
+    
+    # Check if port is in use
+    local initial_pids=$(get_pids_on_port "$port")
+    if [[ -z "$initial_pids" ]]; then
+        log_success "Port $port is already free"
+        exit 0
+    fi
+    
+    # Show what's on the port
+    if [[ "$VERBOSE" == true || "$DRY_RUN" == true ]]; then
+        log_info "Processes on port $port:"
+        get_process_info "$port" | while IFS= read -r line; do
+            log_verbose "  $line"
+        done
+    else
+        log_info "Found $(echo "$initial_pids" | wc -l | tr -d ' ') process(es) on port $port"
+    fi
+    
+    # Execute kill stages
+    local success=false
+    
+    # Ultra force mode - skip to nuclear
+    if [[ "$ULTRA_FORCE" == true ]]; then
+        log_warning "Ultra-force mode: going nuclear immediately"
+        if stage_nuclear "$port"; then
+            success=true
+        fi
+    else
+        # Stage 1: Graceful (unless force mode)
+        if [[ "$FORCE_KILL" == false ]]; then
+            if stage_graceful_shutdown "$port"; then
+                success=true
+            fi
+        fi
+        
+        # Stage 2: Force kill
+        if [[ "$success" == false ]]; then
+            if stage_force_kill "$port"; then
+                success=true
+            fi
+        fi
+        
+        # Stage 3: Parent hunt (unless disabled)
+        if [[ "$success" == false && "$NO_PARENT" == false ]]; then
+            if stage_parent_hunt "$port"; then
+                success=true
+            fi
+        fi
+        
+        # Stage 4: Nuclear
+        if [[ "$success" == false ]]; then
+            if stage_nuclear "$port"; then
+                success=true
+            fi
+        fi
+    fi
+    
+    # Final verification
+    if [[ "$DRY_RUN" == false ]]; then
+        sleep "$FINAL_CHECK_DELAY"
+        local final_pids=$(get_pids_on_port "$port")
+        if [[ -z "$final_pids" ]]; then
+            log_success "Port $port is now free! 🎉"
+            exit 0
+        else
+            log_error "Failed to free port $port. Remaining processes:"
+            get_process_info "$port"
+            exit 1
+        fi
+    else
+        log_info "Dry run complete. Use without -d to actually kill processes."
+        exit 0
+    fi
+}
+
+# Run main function
+main "$@"
