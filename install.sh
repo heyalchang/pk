@@ -55,7 +55,7 @@ fi
 
 # Verify installation
 if command -v pk >/dev/null 2>&1; then
-    info "pk installed successfully!"
+    info "pk installed successfully."
     pk --version
 else
     info "pk installed to $INSTALL_DIR/$SCRIPT_NAME"

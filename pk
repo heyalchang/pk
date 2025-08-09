@@ -107,7 +107,7 @@ log_warning() {
 }
 
 log_error() {
-    log "${RED}[✗]${NC} $1" >&2
+    log "${RED}[ERROR]${NC} $1" >&2
 }
 
 # Get all PIDs on a port
@@ -504,7 +504,7 @@ main() {
         sleep "$FINAL_CHECK_DELAY"
         local final_pids=$(get_pids_on_port "$port")
         if [[ -z "$final_pids" ]]; then
-            log_success "Port $port is now free! 🎉"
+            log_success "Port $port is now free"
             exit 0
         else
             log_error "Failed to free port $port. Remaining processes:"
