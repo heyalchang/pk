@@ -2,6 +2,8 @@
 
 Kill processes occupying a port. Handles process monitors that respawn children.
 
+Works by escalating from graceful shutdown to parent hunting, ensuring ports actually get freed. Just run `pk 3000`.
+
 ## Installation
 
 ### Quick Install
